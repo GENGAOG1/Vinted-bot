@@ -1,744 +1,743 @@
 import os
 import json
+import asyncio
+import logging
 import threading
 from pathlib import Path
-from urllib.parse import quote_plus
-
-from flask import Flask
+from typing import Any, Optional
 import discord
 from discord.ext import commands, tasks
-
-
+from flask import Flask, jsonify
+from vinted import Vinted
+# ============================================================
+# LOGGING
+# ============================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+logger = logging.getLogger("vinted-bot")
 # ============================================================
 # ENVIRONMENT
 # ============================================================
-
-TOKEN = os.getenv("DISCORD_TOKEN")
-
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+if not DISCORD_TOKEN:
+    raise RuntimeError("DISCORD_TOKEN fehlt in den Render Environment Variables.")
 PORT = int(os.getenv("PORT", "10000"))
-
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 CONFIG_FILE = DATA_DIR / "config.json"
-
-
+SEEN_FILE = DATA_DIR / "seen.json"
 # ============================================================
 # DEFAULT CONFIG
 # ============================================================
-
 DEFAULT_CONFIG = {
     "brands": [
         "Nike",
-        "Ralph Lauren"
+        "Ralph Lauren",
+        "Adidas",
+        "Tommy Hilfiger",
+        "Lacoste",
+        "Carhartt"
     ],
     "channel_id": None,
+    # 300 Sekunden = 5 Minuten
+    # Absichtlich nicht 20 Sekunden, damit die Suche nicht
+    # unnötig aggressiv gegen Vinted läuft.
     "interval": 300,
-    "max_price": None
+    "max_price": None,
+    # Anzahl der Treffer pro Markensuche
+    "results_per_brand": 20
 }
-
-
 # ============================================================
-# STORAGE
+# CONFIG HELPERS
 # ============================================================
-
-def ensure_storage():
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def load_config():
-    ensure_storage()
-
-    if not CONFIG_FILE.exists():
-        config = DEFAULT_CONFIG.copy()
-        config["brands"] = DEFAULT_CONFIG["brands"].copy()
-
-        save_config(config)
-        return config
-
+def load_json(path: Path, default):
+    if not path.exists():
+        return default
     try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        config = DEFAULT_CONFIG.copy()
-        config.update(data)
-
-        if not isinstance(config.get("brands"), list):
-            config["brands"] = []
-
-        return config
-
+        with path.open("r", encoding="utf-8") as f:
+            return json.load(f)
     except Exception as e:
-        print(f"[CONFIG] Fehler beim Laden: {e}")
-
-        config = DEFAULT_CONFIG.copy()
-        config["brands"] = DEFAULT_CONFIG["brands"].copy()
-
-        return config
-
-
-def save_config(config):
-    ensure_storage()
-
-    temporary = CONFIG_FILE.with_suffix(".tmp")
-
-    with open(temporary, "w", encoding="utf-8") as f:
-        json.dump(
-            config,
-            f,
-            indent=4,
-            ensure_ascii=False
-        )
-
-    temporary.replace(CONFIG_FILE)
-
-
-config = load_config()
-
-
+        logger.error("Fehler beim Laden von %s: %s", path, e)
+        return default
+def save_json(path: Path, data):
+    try:
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
+    except Exception as e:
+        logger.error("Fehler beim Speichern von %s: %s", path, e)
+config = load_json(CONFIG_FILE, DEFAULT_CONFIG.copy())
+# Fehlende Config-Werte nachtragen
+for key, value in DEFAULT_CONFIG.items():
+    if key not in config:
+        config[key] = value
+save_json(CONFIG_FILE, config)
+seen_ids = set(load_json(SEEN_FILE, []))
+def save_seen():
+    # Nicht unendlich wachsen lassen
+    limited = list(seen_ids)[-5000:]
+    save_json(SEEN_FILE, limited)
 # ============================================================
-# FLASK WEB SERVER
+# VINTED
 # ============================================================
-
+vinted = Vinted(
+    domain="de",
+    language="de-DE"
+)
+# ============================================================
+# DISCORD
+# ============================================================
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+bot = commands.Bot(
+    command_prefix="!",
+    intents=intents,
+    help_command=None
+)
+# ============================================================
+# FLASK / RENDER WEB SERVICE
+# ============================================================
 app = Flask(__name__)
-
-
 @app.route("/")
 def home():
-    return """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Vinted Finder</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <style>
-            body {
-                background: #111;
-                color: white;
-                font-family: Arial, sans-serif;
-                text-align: center;
-                padding-top: 80px;
-            }
-
-            .box {
-                max-width: 600px;
-                margin: auto;
-                padding: 30px;
-                background: #1c1c1c;
-                border-radius: 15px;
-            }
-
-            .online {
-                color: #43e97b;
-                font-weight: bold;
-            }
-        </style>
-    </head>
-
-    <body>
-        <div class="box">
-            <h1>🛍️ Vinted Finder</h1>
-            <p class="online">● ONLINE</p>
-            <p>Discord Bot is running.</p>
-        </div>
-    </body>
-    </html>
-    """
-
-
+    return jsonify({
+        "status": "online",
+        "bot": "Vinted Discord Bot"
+    })
 @app.route("/health")
 def health():
-    return {
-        "status": "online",
-        "bot": str(bot.user) if bot.user else None
-    }
-
-
+    return jsonify({
+        "status": "healthy"
+    })
 def run_web_server():
-    print(f"[WEB] Starting HTTP server on port {PORT}")
-
     app.run(
         host="0.0.0.0",
         port=PORT,
         debug=False,
         use_reloader=False
     )
-
-
 # ============================================================
-# DISCORD
+# VINTED HELPERS
 # ============================================================
-
-intents = discord.Intents.default()
-intents.message_content = True
-
-bot = commands.Bot(
-    command_prefix="!",
-    intents=intents,
-    help_command=None
-)
-
-
+def get_value(obj: Any, name: str, default=None):
+    """
+    Holt Attribute oder Dictionary-Wert.
+    """
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+def get_photo_url(item: Any) -> Optional[str]:
+    photo = get_value(item, "photo")
+    if not photo:
+        return None
+    if isinstance(photo, str):
+        return photo
+    # Verschiedene mögliche Wrapper-Felder
+    for field in (
+        "url",
+        "full_size_url",
+        "full_size",
+        "image_url"
+    ):
+        value = get_value(photo, field)
+        if value:
+            return str(value)
+    return None
+def get_item_id(item: Any) -> Optional[str]:
+    value = get_value(item, "id")
+    if value is None:
+        return None
+    return str(value)
+def get_item_title(item: Any) -> str:
+    return str(
+        get_value(item, "title", "Unbekannter Artikel")
+    )
+def get_item_brand(item: Any) -> str:
+    return str(
+        get_value(item, "brand_title", "Unbekannte Marke")
+    )
+def get_item_price(item: Any) -> Optional[float]:
+    raw = get_value(item, "price")
+    if raw is None:
+        return None
+    try:
+        return float(str(raw).replace(",", "."))
+    except (ValueError, TypeError):
+        return None
+def get_item_url(item: Any) -> Optional[str]:
+    value = get_value(item, "url")
+    if value:
+        return str(value)
+    item_id = get_item_id(item)
+    if item_id:
+        return f"https://www.vinted.de/items/{item_id}"
+    return None
+# ============================================================
+# VINTED SEARCH
+# ============================================================
+def search_brand_sync(brand: str):
+    """
+    Synchrone Vinted-Suche.
+    Wird später mit asyncio.to_thread() aufgerufen,
+    damit Discord nicht blockiert.
+    """
+    max_price = config.get("max_price")
+    results_per_brand = int(
+        config.get("results_per_brand", 20)
+    )
+    kwargs = {
+        "query": brand,
+        "order": "newest_first",
+        "per_page": results_per_brand
+    }
+    if max_price is not None:
+        kwargs["price_to"] = max_price
+    response = vinted.search(**kwargs)
+    return get_value(response, "items", []) or []
+async def search_brand(brand: str):
+    return await asyncio.to_thread(
+        search_brand_sync,
+        brand
+    )
+# ============================================================
+# DISCORD EMBED
+# ============================================================
+def create_item_embed(item: Any) -> discord.Embed:
+    title = get_item_title(item)
+    brand = get_item_brand(item)
+    price = get_item_price(item)
+    url = get_item_url(item)
+    photo = get_photo_url(item)
+    if price is not None:
+        price_text = f"{price:.2f} €"
+    else:
+        price_text = "Preis unbekannt"
+    embed = discord.Embed(
+        title=title[:256],
+        url=url,
+        description="🛍️ Neuer Vinted-Artikel gefunden!",
+        color=discord.Color.blurple()
+    )
+    embed.add_field(
+        name="🏷️ Marke",
+        value=brand[:1024],
+        inline=True
+    )
+    embed.add_field(
+        name="💰 Preis",
+        value=price_text,
+        inline=True
+    )
+    if url:
+        embed.add_field(
+            name="🔗 Artikel",
+            value=f"[Auf Vinted öffnen]({url})",
+            inline=False
+        )
+    if photo:
+        try:
+            embed.set_thumbnail(url=photo)
+        except Exception:
+            pass
+    embed.set_footer(
+        text="Vinted Monitor"
+    )
+    return embed
+# ============================================================
+# SEND NEW ITEM
+# ============================================================
+async def send_item(item: Any, channel: discord.TextChannel):
+    item_id = get_item_id(item)
+    if not item_id:
+        return False
+    if item_id in seen_ids:
+        return False
+    embed = create_item_embed(item)
+    try:
+        await channel.send(embed=embed)
+        seen_ids.add(item_id)
+        return True
+    except discord.Forbidden:
+        logger.error(
+            "Keine Berechtigung, in #%s zu schreiben.",
+            channel.name
+        )
+    except discord.HTTPException as e:
+        logger.error(
+            "Discord HTTP Fehler: %s",
+            e
+        )
+    return False
+# ============================================================
+# AUTOMATIC FINDER
+# ============================================================
+@tasks.loop(seconds=300)
+async def finder_loop():
+    """
+    Automatische Vinted-Suche.
+    """
+    interval = int(config.get("interval", 300))
+    # tasks.loop kann nicht dynamisch mit config.interval
+    # gesteuert werden, deshalb warten wir hier zusätzlich.
+    #
+    # Der Loop läuft nur als Scheduler.
+    await asyncio.sleep(0)
+    channel_id = config.get("channel_id")
+    if not channel_id:
+        logger.info(
+            "Kein Discord-Kanal konfiguriert."
+        )
+        return
+    channel = bot.get_channel(int(channel_id))
+    if channel is None:
+        logger.warning(
+            "Konfigurierter Discord-Kanal wurde nicht gefunden."
+        )
+        return
+    brands = config.get("brands", [])
+    if not brands:
+        logger.info(
+            "Keine Marken konfiguriert."
+        )
+        return
+    logger.info(
+        "Starte Vinted-Suche für: %s",
+        ", ".join(brands)
+    )
+    new_items = 0
+    for brand in brands:
+        try:
+            items = await search_brand(brand)
+            logger.info(
+                "%s: %s Treffer",
+                brand,
+                len(items)
+            )
+            # Neue Artikel zuerst
+            for item in reversed(items):
+                sent = await send_item(
+                    item,
+                    channel
+                )
+                if sent:
+                    new_items += 1
+                # Kleine Pause zwischen Discord-Nachrichten
+                if sent:
+                    await asyncio.sleep(1)
+        except Exception as e:
+            logger.error(
+                "Vinted-Suche für %s fehlgeschlagen: %s",
+                brand,
+                e
+            )
+            # Bei Fehler mit nächster Marke weitermachen
+            continue
+    save_seen()
+    logger.info(
+        "Suche abgeschlossen. Neue Artikel: %s",
+        new_items
+    )
+# ============================================================
+# INITIAL BASELINE
+# ============================================================
+async def initialize_seen_items():
+    """
+    Beim ersten Start werden die aktuell vorhandenen Treffer
+    als bereits bekannt gespeichert.
+    Dadurch werden nicht sofort 100 alte Artikel in Discord
+    gespammt.
+    """
+    global seen_ids
+    if seen_ids:
+        return
+    logger.info(
+        "Erster Start: erstelle Vinted-Baseline..."
+    )
+    brands = config.get("brands", [])
+    for brand in brands:
+        try:
+            items = await search_brand(brand)
+            for item in items:
+                item_id = get_item_id(item)
+                if item_id:
+                    seen_ids.add(item_id)
+        except Exception as e:
+            logger.error(
+                "Baseline für %s fehlgeschlagen: %s",
+                brand,
+                e
+            )
+    save_seen()
+    logger.info(
+        "Baseline gespeichert: %s Artikel",
+        len(seen_ids)
+    )
+# ============================================================
+# BOT EVENTS
+# ============================================================
+@bot.event
+async def on_ready():
+    logger.info(
+        "Discord verbunden als %s",
+        bot.user
+    )
+    logger.info(
+        "Invite: %s",
+        f"https://discord.com/oauth2/authorize?client_id={bot.user.id}&permissions=2147483648&scope=bot"
+    )
+    await initialize_seen_items()
+    if not finder_loop.is_running():
+        finder_loop.start()
+    logger.info(
+        "Vinted Finder gestartet."
+    )
 # ============================================================
 # HELP
 # ============================================================
-
 @bot.command()
 async def help(ctx):
-
     embed = discord.Embed(
-        title="🛍️ Vinted Finder",
+        title="🤖 Vinted Bot",
         description="Verfügbare Befehle:",
-        color=0x7B2CBF
+        color=discord.Color.blurple()
     )
-
     embed.add_field(
         name="⚙️ Konfiguration",
         value=(
-            "`!config` – aktuelle Konfiguration\n"
-            "`!config show` – Konfiguration anzeigen\n"
-            "`!config brand add Nike`\n"
-            "`!config brand remove Nike`\n"
+            "`!config show`\n"
+            "`!config brand add <Marke>`\n"
+            "`!config brand remove <Marke>`\n"
             "`!config brand list`\n"
-            "`!config channel #channel`\n"
-            "`!config interval 300`\n"
-            "`!config maxprice 100`\n"
+            "`!config channel #kanal`\n"
+            "`!config interval <Sekunden>`\n"
+            "`!config maxprice <Preis>`\n"
             "`!config maxprice off`"
         ),
         inline=False
     )
-
     embed.add_field(
         name="🔎 Suche",
         value=(
-            "`!search Nike`\n"
-            "`!search Ralph Lauren`\n"
+            "`!search <Marke>`\n"
             "`!search all`"
         ),
         inline=False
     )
-
     await ctx.send(embed=embed)
-
-
 # ============================================================
-# CONFIG DISPLAY
+# CONFIG GROUP
 # ============================================================
-
-@bot.group(name="config", invoke_without_command=True)
+@bot.group(
+    name="config",
+    invoke_without_command=True
+)
+@commands.has_guild_permissions(manage_guild=True)
 async def config_command(ctx):
-    await send_config(ctx)
-
-
-async def send_config(ctx):
-
+    await ctx.send(
+        "Nutze `!config show`, um die aktuelle Konfiguration zu sehen."
+    )
+# ============================================================
+# CONFIG SHOW
+# ============================================================
+@config_command.command(name="show")
+@commands.has_guild_permissions(manage_guild=True)
+async def config_show(ctx):
     brands = config.get("brands", [])
-
-    if brands:
-        brand_text = "\n".join(
-            f"• {brand}"
-            for brand in brands
-        )
-    else:
-        brand_text = "Keine Marken konfiguriert."
-
     channel_id = config.get("channel_id")
-
     if channel_id:
-        channel = bot.get_channel(channel_id)
-
-        if channel:
-            channel_text = channel.mention
-        else:
-            channel_text = f"<#{channel_id}>"
+        channel = bot.get_channel(int(channel_id))
+        channel_text = channel.mention if channel else f"`{channel_id}`"
     else:
         channel_text = "Nicht gesetzt"
-
     max_price = config.get("max_price")
-
     if max_price is None:
         price_text = "Kein Limit"
     else:
         price_text = f"{max_price:.2f} €"
-
     embed = discord.Embed(
-        title="⚙️ Vinted Finder – Config",
-        color=0x7B2CBF
+        title="⚙️ Vinted Bot Konfiguration",
+        color=discord.Color.blurple()
     )
-
     embed.add_field(
         name="🏷️ Marken",
-        value=brand_text,
+        value="\n".join(
+            f"• {brand}" for brand in brands
+        ) or "Keine",
         inline=False
     )
-
     embed.add_field(
-        name="📢 Ausgabe-Channel",
+        name="📢 Kanal",
         value=channel_text,
-        inline=True
+        inline=False
     )
-
     embed.add_field(
         name="⏱️ Intervall",
-        value=f"{config.get('interval', 300)} Sekunden",
+        value=f"{config.get('interval')} Sekunden",
         inline=True
     )
-
     embed.add_field(
-        name="💰 Preislimit",
+        name="💰 Maximalpreis",
         value=price_text,
         inline=True
     )
-
+    embed.add_field(
+        name="🔎 Treffer pro Marke",
+        value=str(config.get("results_per_brand", 20)),
+        inline=True
+    )
     await ctx.send(embed=embed)
-
-
-@config_command.command(name="show")
-async def config_show(ctx):
-    await send_config(ctx)
-
-
 # ============================================================
 # BRAND ADD
 # ============================================================
-
-@config_command.group(name="brand", invoke_without_command=True)
-async def config_brand(ctx):
-
-    await ctx.send(
-        "Benutzung:\n"
-        "`!config brand add Nike`\n"
-        "`!config brand remove Nike`\n"
-        "`!config brand list`"
-    )
-
-
-@config_brand.command(name="add")
-async def config_brand_add(ctx, *, brand: str):
-
+@config_command.command(name="brand_add")
+@commands.has_guild_permissions(manage_guild=True)
+async def brand_add(ctx, *, brand: str):
     brand = brand.strip()
-
     if not brand:
-        await ctx.send(
-            "❌ Bitte gib eine Marke an."
-        )
+        await ctx.send("❌ Bitte eine Marke angeben.")
         return
-
-    existing = config["brands"]
-
-    if any(
-        x.lower() == brand.lower()
-        for x in existing
-    ):
+    brands = config.setdefault("brands", [])
+    if any(x.lower() == brand.lower() for x in brands):
         await ctx.send(
             f"⚠️ **{brand}** ist bereits aktiviert."
         )
         return
-
-    existing.append(brand)
-
-    save_config(config)
-
+    brands.append(brand)
+    save_json(CONFIG_FILE, config)
     await ctx.send(
-        f"✅ **{brand}** wurde zur Suche hinzugefügt."
+        f"✅ **{brand}** wurde hinzugefügt."
     )
-
-
 # ============================================================
 # BRAND REMOVE
 # ============================================================
-
-@config_brand.command(name="remove")
-async def config_brand_remove(ctx, *, brand: str):
-
-    brand = brand.strip()
-
+@config_command.command(name="brand_remove")
+@commands.has_guild_permissions(manage_guild=True)
+async def brand_remove(ctx, *, brand: str):
+    brands = config.get("brands", [])
     found = None
-
-    for existing in config["brands"]:
-
+    for existing in brands:
         if existing.lower() == brand.lower():
             found = existing
             break
-
-    if found is None:
+    if not found:
         await ctx.send(
-            f"❌ **{brand}** ist nicht konfiguriert."
+            f"❌ **{brand}** ist nicht aktiviert."
         )
         return
-
-    config["brands"].remove(found)
-
-    save_config(config)
-
+    brands.remove(found)
+    save_json(CONFIG_FILE, config)
     await ctx.send(
         f"✅ **{found}** wurde entfernt."
     )
-
-
 # ============================================================
 # BRAND LIST
 # ============================================================
-
-@config_brand.command(name="list")
-async def config_brand_list(ctx):
-
-    if not config["brands"]:
+@config_command.command(name="brand_list")
+@commands.has_guild_permissions(manage_guild=True)
+async def brand_list(ctx):
+    brands = config.get("brands", [])
+    if not brands:
         await ctx.send(
-            "🏷️ Keine Marken konfiguriert."
+            "📭 Keine Marken aktiviert."
         )
         return
-
-    text = "\n".join(
-        f"• {brand}"
-        for brand in config["brands"]
+    await ctx.send(
+        "🏷️ **Aktive Marken:**\n" +
+        "\n".join(
+            f"• `{brand}`"
+            for brand in brands
+        )
     )
-
-    embed = discord.Embed(
-        title="🏷️ Aktive Marken",
-        description=text,
-        color=0x7B2CBF
-    )
-
-    await ctx.send(embed=embed)
-
-
 # ============================================================
 # CHANNEL
 # ============================================================
-
 @config_command.command(name="channel")
+@commands.has_guild_permissions(manage_guild=True)
 async def config_channel(
     ctx,
     channel: discord.TextChannel
 ):
-
     config["channel_id"] = channel.id
-
-    save_config(config)
-
+    save_json(CONFIG_FILE, config)
     await ctx.send(
-        f"✅ Vinted-Meldungen werden jetzt "
-        f"in {channel.mention} gesendet."
+        f"✅ Vinted-Artikel werden ab jetzt in {channel.mention} gepostet."
     )
-
-
 # ============================================================
 # INTERVAL
 # ============================================================
-
 @config_command.command(name="interval")
+@commands.has_guild_permissions(manage_guild=True)
 async def config_interval(
     ctx,
     seconds: int
 ):
-
-    if seconds < 60:
-
+    # Nicht aggressiv gegen Vinted abfragen.
+    MIN_INTERVAL = 60
+    MAX_INTERVAL = 86400
+    if seconds < MIN_INTERVAL:
         await ctx.send(
-            "❌ Das Intervall muss mindestens "
-            "60 Sekunden betragen."
+            f"❌ Das Minimum beträgt **{MIN_INTERVAL} Sekunden**."
         )
         return
-
-    if seconds > 86400:
-
+    if seconds > MAX_INTERVAL:
         await ctx.send(
-            "❌ Das Intervall darf maximal "
-            "86400 Sekunden betragen."
+            f"❌ Das Maximum beträgt **{MAX_INTERVAL} Sekunden**."
         )
         return
-
     config["interval"] = seconds
-
-    save_config(config)
-
-    finder_loop.change_interval(
-        seconds=seconds
-    )
-
+    save_json(CONFIG_FILE, config)
     await ctx.send(
-        f"✅ Suchintervall auf "
-        f"**{seconds} Sekunden** gesetzt."
+        f"✅ Suchintervall auf **{seconds} Sekunden** gesetzt."
     )
-
-
 # ============================================================
 # MAX PRICE
 # ============================================================
-
 @config_command.command(name="maxprice")
+@commands.has_guild_permissions(manage_guild=True)
 async def config_maxprice(
     ctx,
     value: str
 ):
-
-    if value.lower() in (
-        "off",
-        "none",
-        "aus"
-    ):
-
+    if value.lower() == "off":
         config["max_price"] = None
-
-        save_config(config)
-
+        save_json(CONFIG_FILE, config)
         await ctx.send(
             "✅ Preislimit deaktiviert."
         )
-
         return
-
     try:
-
         price = float(
             value.replace(",", ".")
         )
-
-        if price < 0:
+        if price <= 0:
             raise ValueError
-
     except ValueError:
-
         await ctx.send(
-            "❌ Beispiel:\n"
-            "`!config maxprice 100`"
+            "❌ Beispiel: `!config maxprice 50`"
         )
-
         return
-
     config["max_price"] = price
-
-    save_config(config)
-
+    save_json(CONFIG_FILE, config)
     await ctx.send(
-        f"✅ Preislimit auf "
-        f"**{price:.2f} €** gesetzt."
+        f"✅ Maximalpreis auf **{price:.2f} €** gesetzt."
     )
-
-
 # ============================================================
-# VINTED SEARCH URL
+# MANUAL SEARCH
 # ============================================================
-
-def create_vinted_search_url(brand):
-
-    query = quote_plus(brand)
-
-    return (
-        "https://www.vinted.de/catalog"
-        f"?search_text={query}"
-    )
-
-
-# ============================================================
-# SEARCH COMMAND
-# ============================================================
-
 @bot.command()
-async def search(
-    ctx,
-    *,
-    brand: str = None
-):
-
-    if not brand:
-
-        await ctx.send(
-            "❌ Beispiel:\n"
-            "`!search Nike`\n"
-            "`!search Ralph Lauren`\n"
-            "`!search all`"
-        )
-
-        return
-
+async def search(ctx, *, brand: str):
+    brand = brand.strip()
     if brand.lower() == "all":
-
-        brands = config["brands"]
-
-        if not brands:
-
+        brands = config.get("brands", [])
+    else:
+        brands = [brand]
+    await ctx.send(
+        "🔎 Ich suche gerade auf Vinted..."
+    )
+    total = 0
+    for current_brand in brands:
+        try:
+            items = await search_brand(
+                current_brand
+            )
+            # Bei manueller Suche maximal 5 Treffer
+            items = items[:5]
+            if not items:
+                continue
+            for item in items:
+                embed = create_item_embed(item)
+                await ctx.send(
+                    embed=embed
+                )
+                total += 1
+                await asyncio.sleep(1)
+        except Exception as e:
+            logger.error(
+                "Manuelle Suche fehlgeschlagen: %s",
+                e
+            )
             await ctx.send(
-                "❌ Es sind keine Marken konfiguriert."
+                f"❌ Suche für **{current_brand}** fehlgeschlagen."
             )
-
-            return
-
-        links = []
-
-        for item in brands:
-
-            url = create_vinted_search_url(
-                item
-            )
-
-            links.append(
-                f"**{item}**\n{url}"
-            )
-
-        embed = discord.Embed(
-            title="🔎 Vinted-Suchen",
-            description="\n\n".join(links),
-            color=0x7B2CBF
-        )
-
-        await ctx.send(embed=embed)
-
-        return
-
-    url = create_vinted_search_url(brand)
-
-    embed = discord.Embed(
-        title=f"🔎 Vinted – {brand}",
-        description=(
-            f"Suche nach **{brand}**:\n\n"
-            f"{url}"
-        ),
-        color=0x7B2CBF
+    await ctx.send(
+        f"✅ Suche beendet. **{total} Artikel** gefunden."
     )
-
-    embed.add_field(
-        name="💰 Preislimit",
-        value=(
-            "Kein Limit"
-            if config["max_price"] is None
-            else f"{config['max_price']:.2f} €"
-        )
-    )
-
-    await ctx.send(embed=embed)
-
-
 # ============================================================
-# AUTOMATIC TASK
+# STATUS
 # ============================================================
-
-@tasks.loop(seconds=60)
-async def finder_loop():
-
-    finder_loop.change_interval(
-        seconds=config.get(
-            "interval",
-            300
-        )
+@bot.command()
+async def status(ctx):
+    channel_id = config.get("channel_id")
+    channel_text = (
+        f"<#{channel_id}>"
+        if channel_id
+        else "Nicht gesetzt"
     )
-
-    channel_id = config.get(
-        "channel_id"
+    await ctx.send(
+        "🟢 **Vinted Bot läuft**\n\n"
+        f"🏷️ Marken: `{len(config.get('brands', []))}`\n"
+        f"📢 Kanal: {channel_text}\n"
+        f"⏱️ Intervall: `{config.get('interval')}s`\n"
+        f"💰 Maxpreis: `{config.get('max_price') or 'kein Limit'}`\n"
+        f"📦 Bereits bekannte Artikel: `{len(seen_ids)}`"
     )
-
-    if not channel_id:
-        return
-
-    channel = bot.get_channel(
-        channel_id
-    )
-
-    if not channel:
-        return
-
-    # ========================================================
-    # VINTED PROVIDER
-    # ========================================================
-    #
-    # Hier wird absichtlich keine automatische Abfrage
-    # der normalen Vinted-Webseite durchgeführt.
-    #
-    # Sobald eine von Vinted autorisierte API/Datenquelle
-    # vorhanden ist, kann hier die Suche angeschlossen werden.
-    #
-    # ========================================================
-
-    return
-
-
 # ============================================================
-# EVENTS
+# ERROR HANDLER
 # ============================================================
-
 @bot.event
-async def on_ready():
-
-    print("=" * 60)
-    print("VINTED FINDER")
-    print("=" * 60)
-
-    print(f"Bot: {bot.user}")
-    print(f"Guilds: {len(bot.guilds)}")
-    print(f"Brands: {config['brands']}")
-    print(f"Interval: {config['interval']} seconds")
-    print(f"HTTP Port: {PORT}")
-
-    print("=" * 60)
-
-    if not finder_loop.is_running():
-        finder_loop.start()
-
-
-# ============================================================
-# COMMAND ERRORS
-# ============================================================
-
-@bot.event
-async def on_command_error(
-    ctx,
-    error
-):
-
+async def on_command_error(ctx, error):
+    if isinstance(
+        error,
+        commands.MissingPermissions
+    ):
+        await ctx.send(
+            "❌ Du brauchst die Berechtigung **Server verwalten**."
+        )
+        return
     if isinstance(
         error,
         commands.MissingRequiredArgument
     ):
-
         await ctx.send(
-            "❌ Fehlender Parameter.\n"
-            "Benutze `!help`."
+            "❌ Es fehlt ein Argument. Nutze `!help`."
         )
-
         return
-
     if isinstance(
         error,
         commands.BadArgument
     ):
-
         await ctx.send(
-            "❌ Ungültiger Parameter.\n"
-            "Benutze `!help`."
+            "❌ Das Argument konnte nicht verarbeitet werden."
         )
-
         return
-
     if isinstance(
         error,
         commands.CommandNotFound
     ):
         return
-
-    print(
-        f"[COMMAND ERROR] "
-        f"{ctx.command}: {error}"
+    logger.error(
+        "Command error: %s",
+        error
     )
-
-
 # ============================================================
 # START
 # ============================================================
-
-if not TOKEN:
-
-    raise RuntimeError(
-        "DISCORD_TOKEN wurde nicht gesetzt."
+def main():
+    # Render-Webserver starten
+    web_thread = threading.Thread(
+        target=run_web_server,
+        daemon=True
     )
-
-
-# Flask in separatem Thread starten
-web_thread = threading.Thread(
-    target=run_web_server,
-    daemon=True
-)
-
-web_thread.start()
-
-
-# Discord Bot starten
-bot.run(TOKEN)
+    web_thread.start()
+    logger.info(
+        "Webserver läuft auf Port %s",
+        PORT
+    )
+    # Discord starten
+    bot.run(DISCORD_TOKEN)
+if __name__ == "__main__":
+    main()
