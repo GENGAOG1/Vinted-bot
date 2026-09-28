@@ -8,7 +8,7 @@ from typing import Any, Optional
 import discord
 from discord.ext import commands, tasks
 from flask import Flask, jsonify
-from vinted import Vinted
+from vinted_api_wrapper import Vinted
 # ============================================================
 # LOGGING
 # ============================================================
